@@ -1,0 +1,126 @@
+name: Mesh2Motion Bird Blender 5.2.1 native export
+
+on:
+  push:
+    branches:
+      - tmp-m2m-bird-blender52-20260906
+  workflow_dispatch:
+
+jobs:
+  export-bird:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout harness branch
+        uses: actions/checkout@v4
+
+      - name: Clone exact Mesh2Motion source-assets commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/Mesh2Motion/mesh2motion-assets.git m2m-assets
+          cd m2m-assets
+          git checkout --detach 9ba82162522213f3226c099ce6d0576179556a35
+          test "$(git rev-parse HEAD)" = "9ba82162522213f3226c099ce6d0576179556a35"
+          test "$(git hash-object 3d-models/model-bird.blend)" = "cb77afecef716c4912f42fa39db89fbeb6657637"
+          test "$(git hash-object rigs/rig-bird.blend)" = "70d783a93af49517246113a39a78fcf32e3d81a9"
+          test "$(git hash-object rigs/bird/animation-bird-flap.blend)" = "e56f857e2ce73a33123bc329bb810fde0a40aacf"
+          test "$(git hash-object rigs/bird/animation-bird-glide.blend)" = "3cab6aace7c16cf83fd9848babfdd7494f5571f5"
+          test "$(git hash-object rigs/bird/animation-bird-idle.blend)" = "3a134ee290dc588d2c9ecf6a90d4fae94dcb2ffb"
+          test "$(git hash-object rigs/bird/animation-bird-rest-pose.blend)" = "77a9254b18d30564f27e9552e0d287a439d6eb33"
+          test "$(git hash-object rigs/bird/animation-bird-walk.blend)" = "62d40824f326261663e6b3f598a9b7ccaf8ba24b"
+          test "$(git hash-object python-scripts/combine-and-export.py)" = "5539bd180cdd48b6d58efffd503248e49fff88a5"
+          echo SOURCE_BLOB_MATCH=PASS
+
+      - name: Materialize official Blender 5.2.1 LTS outside app source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/blender-custody"
+          cd "$RUNNER_TEMP/blender-custody"
+          curl -L --fail --retry 3 -o blender-5.2.1-linux-x64.tar.xz https://download.blender.org/release/Blender5.2/blender-5.2.1-linux-x64.tar.xz
+          curl -L --fail --retry 3 -o blender-5.2.1.sha256 https://download.blender.org/release/Blender5.2/blender-5.2.1.sha256
+          test "$(stat -c%s blender-5.2.1-linux-x64.tar.xz)" = "383688088"
+          grep ' blender-5.2.1-linux-x64.tar.xz$' blender-5.2.1.sha256 > blender-linux.sha256
+          sha256sum -c blender-linux.sha256
+          tar -xf blender-5.2.1-linux-x64.tar.xz
+          BLENDER_BIN=$(find "$RUNNER_TEMP/blender-custody" -maxdepth 2 -type f -name blender | head -1)
+          test -n "$BLENDER_BIN"
+          "$BLENDER_BIN" --version | tee "$GITHUB_WORKSPACE/blender-version.txt"
+          echo "BLENDER_BIN=$BLENDER_BIN" >> "$GITHUB_ENV"
+          sha256sum blender-5.2.1-linux-x64.tar.xz | tee "$GITHUB_WORKSPACE/blender-archive.sha256"
+          echo BLENDER_NATIVE_SMOKE=PASS
+
+      - name: Run upstream combine-and-export.py on Bird source
+        shell: bash
+        run: |
+          set -euo pipefail
+          "$BLENDER_BIN" -b "$GITHUB_WORKSPACE/m2m-assets/rigs/rig-bird.blend" --python "$GITHUB_WORKSPACE/m2m-assets/python-scripts/combine-and-export.py" 2>&1 | tee "$GITHUB_WORKSPACE/blender-bird-export.log"
+          OUT="$GITHUB_WORKSPACE/m2m-assets/rigs/bird/bird-animations.glb"
+          test -s "$OUT"
+          cp "$OUT" "$GITHUB_WORKSPACE/bird-animations.glb"
+          sha256sum "$GITHUB_WORKSPACE/bird-animations.glb" | tee "$GITHUB_WORKSPACE/bird-animations.sha256"
+          echo BIRD_BLENDER_EXPORT=PASS
+
+      - name: Inspect exported GLB structure
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, struct, hashlib, pathlib
+          p=pathlib.Path('bird-animations.glb')
+          b=p.read_bytes()
+          magic, version, length = struct.unpack_from('<4sII', b, 0)
+          assert magic == b'glTF' and version == 2 and length == len(b)
+          off=12
+          n, typ=struct.unpack_from('<I4s', b, off); off += 8
+          assert typ == b'JSON'
+          j=json.loads(b[off:off+n].decode('utf-8').rstrip(' \t\r\n\x00'))
+          anim=[a.get('name','') for a in j.get('animations',[])]
+          skins=j.get('skins',[])
+          receipt={
+            'source_repo':'Mesh2Motion/mesh2motion-assets',
+            'source_commit':'9ba82162522213f3226c099ce6d0576179556a35',
+            'export_script':'python-scripts/combine-and-export.py',
+            'blender':'5.2.1 LTS official linux-x64',
+            'output_bytes':len(b),
+            'output_sha256':hashlib.sha256(b).hexdigest(),
+            'glb_version':version,
+            'meshes':len(j.get('meshes',[])),
+            'skins':len(skins),
+            'joints':len(skins[0].get('joints',[])) if skins else 0,
+            'animations':anim,
+            'animation_count':len(anim),
+          }
+          pathlib.Path('bird-export-receipt.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+          print(json.dumps(receipt,indent=2))
+          assert receipt['meshes'] >= 1
+          assert receipt['skins'] >= 1
+          assert receipt['animation_count'] >= 4
+          assert any(x.lower()=='idle' for x in anim)
+          assert any(x.lower()=='walk' for x in anim)
+          PY
+          echo BIRD_GLB_STRUCTURE=PASS
+
+      - name: Assert source hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -e tools
+          test ! -e tests
+          test ! -e probes
+          echo APP_SOURCE_BLOAT=0
+
+      - name: Upload Bird native export evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: m2m-bird-blender52-native
+          path: |
+            bird-animations.glb
+            bird-animations.sha256
+            bird-export-receipt.json
+            blender-version.txt
+            blender-archive.sha256
+            blender-bird-export.log
+          if-no-files-found: error
+          retention-days: 1
